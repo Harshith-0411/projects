@@ -1,0 +1,136 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+
+# Load YOLO model
+model = YOLO("best.pt")
+class_names = model.names
+
+# GPIO Pin Definitions
+IN1, IN2, IN3, IN4, ENA, ENB = 17, 27, 22, 23, 18, 19
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+
+# PWM setup
+pwmA = GPIO.PWM(ENA, 100) # 100 Hz frequency for Motor A
+pwmB = GPIO.PWM(ENB, 100) # 100 Hz frequency for Motor B
+pwmA.start(0)
+pwmB.start(0)
+
+# Motor control functions
+def set_motor(motor, direction, speed):
+    if motor == "A": # Motor A (Left Motors)
+        GPIO.output(IN1, direction[0])
+        GPIO.output(IN2, direction[1])
+        pwmA.ChangeDutyCycle(speed)
+    elif motor == "B": # Motor B (Right Motors)
+        GPIO.output(IN3, direction[0])
+        GPIO.output(IN4, direction[1])
+        pwmB.ChangeDutyCycle(speed)
+
+def move_forward(speed=60):
+    set_motor("A", (GPIO.HIGH, GPIO.LOW), speed)
+    set_motor("B", (GPIO.HIGH, GPIO.LOW), speed)
+
+def turn_left(speed=60):
+    set_motor("A", (GPIO.LOW, GPIO.LOW), 0) # Stop left motors
+    set_motor("B", (GPIO.HIGH, GPIO.LOW), speed) # Right motors forward
+
+def turn_right(speed=60):
+    set_motor("A", (GPIO.HIGH, GPIO.LOW), speed) # Left motors forward
+    set_motor("B", (GPIO.LOW, GPIO.LOW), 0) # Stop right motors
+
+def stop():
+    set_motor("A", (GPIO.LOW, GPIO.LOW), 0)
+    set_motor("B", (GPIO.LOW, GPIO.LOW), 0)
+
+# Initialize video capture
+cap = cv2.VideoCapture(0)
+
+try:
+    while True:
+        ret, img = cap.read()
+        if not ret:
+            break
+
+        # Resize frame for processing
+        img = cv2.resize(img, (480, 270)) # Lower resolution for Raspberry Pi
+        h, w, _ = img.shape
+
+        # Run YOLO prediction
+        results = model.predict(img, device="cpu", imgsz=320)
+
+        pothole_detected = False
+        for r in results:
+            boxes = r.boxes
+            masks = r.masks
+
+            if masks is not None:
+                masks = masks.data.cpu().numpy()
+                for seg, box in zip(masks, boxes):
+                    seg = cv2.resize(seg, (w, h))
+                    contours, _ = cv2.findContours((seg > 0.5).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    for contour in contours:
+                        d = int(box.cls)
+                        c = class_names[d]
+                        if c == "roadpothole": # Assuming 'pothole' is the class name
+                            pothole_detected = True
+
+                            # Calculate position and size of the pothole
+                            x, y, x1, y1 = cv2.boundingRect(contour)
+                            box_area = x1 * y1 # Use area as a proxy for distance
+                            center_x = x + (x1 // 2)
+
+                            # Define thresholds for distance (adjust as per testing)
+                            if box_area > 1000: # Close
+                                distance = "close"
+                            elif box_area > 500: # Medium
+                                distance = "medium"
+                            else: # Far
+                                distance = "far"
+
+                            # Decide car movement based on pothole position and distance
+                            if distance == "close":
+                                print("Close pothole. Stopping.")
+                                stop()
+                                time.sleep(1)
+                            elif distance == "medium":
+                                if center_x < w // 3: # Left side
+                                    print("Medium pothole on the left. Turning right.")
+                                    turn_right()
+                                    time.sleep(1)
+                                elif center_x > 2 * w // 3: # Right side
+                                    print("Medium pothole on the right. Turning left.")
+                                    turn_left()
+                                    time.sleep(1)
+                                else: # Center
+                                    print("Medium pothole ahead. Slowing down.")
+                                    move_forward(speed=50) # Slow down
+                            else: # Far
+                                print("Far pothole detected. Moving forward.")
+                                move_forward()
+
+                            # Draw bounding box
+                            cv2.rectangle(img, (x, y), (x + x1, y + y1), (255, 0, 0), 2)
+                            cv2.putText(img, f"{c} ({distance})", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        if not pothole_detected:
+            print("No pothole detected. Moving forward.")
+            move_forward()
+
+        # Display frame
+        cv2.imshow('Pothole Detection', img)
+
+        # Exit on 'q'
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
